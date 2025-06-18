@@ -14,8 +14,11 @@ def clean_amount(amount_str):
     try:
         # Remove commas and convert to float
         amount_str = str(amount_str).replace(',', '').strip()
-        # Remove any currency symbols
+        # Remove any currency symbols and extra spaces
         amount_str = re.sub(r'[^\d.-]', '', amount_str)
+        # Handle negative amounts
+        if amount_str.startswith('-'):
+            return -float(amount_str[1:]) if amount_str[1:] else None
         return float(amount_str) if amount_str else None
     except ValueError:
         return None
@@ -89,6 +92,34 @@ def format_description(desc):
     # Handle other transactions
     return desc
 
+def extract_withdrawal_amount(row_str, withdrawal_col_value):
+    """Extract withdrawal amount from row data."""
+    # First check the withdrawal column
+    if pd.notna(withdrawal_col_value):
+        amount = clean_amount(withdrawal_col_value)
+        if amount is not None and amount > 0:
+            return amount
+    
+    # Look for withdrawal patterns in the description
+    # Common patterns: "WITHDRAWAL", "DEBIT", "PAYMENT", "PURCHASE"
+    withdrawal_keywords = ['WITHDRAWAL', 'DEBIT', 'PAYMENT', 'PURCHASE', 'PAYTM', 'UPI', 'NEFT', 'RTGS']
+    if any(keyword in row_str.upper() for keyword in withdrawal_keywords):
+        # Look for amount patterns in the description
+        amount_patterns = [
+            r'(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)',  # Numbers with commas and decimals
+            r'(\d+\.\d{2})',  # Decimal amounts
+            r'(\d+)',  # Whole numbers
+        ]
+        
+        for pattern in amount_patterns:
+            matches = re.findall(pattern, row_str)
+            for match in matches:
+                amount = clean_amount(match)
+                if amount is not None and amount > 0:
+                    return amount
+    
+    return None
+
 def extract_bank_statement(pdf_path, password):
     """
     Extract table data from a password-protected PDF bank statement.
@@ -130,6 +161,17 @@ def extract_bank_statement(pdf_path, password):
                 data_df.columns = new_header
                 data_df.columns = [str(col).strip() for col in data_df.columns]
                 print(f"\nCleaned column names: {data_df.columns.tolist()}")
+                
+                # Identify the withdrawal column (6th column, index 5)
+                withdrawal_col_idx = 5  # 6th column (0-indexed)
+                balance_col_idx = 5  # Balance is also in the 6th column or we need to find it
+                
+                # Find balance column
+                for i, col_name in enumerate(data_df.columns):
+                    if 'balance' in str(col_name).lower():
+                        balance_col_idx = i
+                        break
+                
                 transactions = []
                 current_transaction = None
                 # --- Chronological date logic ---
@@ -158,31 +200,46 @@ def extract_bank_statement(pdf_path, password):
                         current_date = found_date
                     # Check if this row contains transaction data
                     has_transaction_data = (
-                        pd.notna(row.get('Withdrawal')) or 
-                        pd.notna(row.get('Balance')) or
+                        pd.notna(row.iloc[withdrawal_col_idx]) or 
+                        pd.notna(row.iloc[balance_col_idx]) or
                         (pd.notna(row['Date   Value Description']) and 
-                         not re.search(r'CURRENCY|ACCOUNT|BRANCH|Date', row_str, re.IGNORECASE))
+                         not re.search(r'CURRENCY|ACCOUNT|BRANCH|Date|STATEMENT|NOMINEE|ADDRESS|IFSC|MICR|Phone|Brought Forward|ABR Complex|EPIP Zone|Whitefield|Bengaluru|Karnataka|560066|560036004|9036002402', row_str, re.IGNORECASE))
                     )
+                    
+                    # Additional check to exclude rows that are clearly not transactions
+                    if has_transaction_data and found_date:
+                        # Skip if the description contains account information
+                        desc_str = str(row['Date   Value Description'])
+                        if re.search(r'STATEMENT DATE|CURRENCY|ACCOUNT TYPE|ACCOUNT NO|NOMINEE REGISTERED|BRANCH ADDRESS|ABR Complex|EPIP Zone|Whitefield|Bengaluru|Karnataka|560066|IFSC|MICR CODE|Phone No|Balance Brought Forward', desc_str, re.IGNORECASE):
+                            has_transaction_data = False
                     if has_transaction_data and found_date:
                         if current_transaction is not None:
                             transactions.append(current_transaction)
+                        
+                        # Extract withdrawal amount from 6th column
+                        withdrawal_amount = extract_withdrawal_amount(row_str, row.iloc[withdrawal_col_idx])
+                        
                         current_transaction = {
                             'Value Date': found_date,
                             'Description': row['Date   Value Description'],
-                            'Withdrawal': row['Withdrawal'] if 'Withdrawal' in row else None,
-                            'Balance': row['Balance'] if 'Balance' in row else None
+                            'Withdrawal': withdrawal_amount,
+                            'Balance': row.iloc[balance_col_idx] if balance_col_idx < len(row) else None
                         }
                     elif current_transaction is not None:
                         if pd.notna(row['Date   Value Description']):
                             current_transaction['Description'] += ' ' + str(row['Date   Value Description'])
-                        if 'Withdrawal' in row and pd.notna(row['Withdrawal']):
-                            current_transaction['Withdrawal'] = row['Withdrawal']
-                        if 'Balance' in row and pd.notna(row['Balance']):
-                            current_transaction['Balance'] = row['Balance']
+                        # Update withdrawal if found in continuation rows
+                        if pd.notna(row.iloc[withdrawal_col_idx]):
+                            withdrawal_amount = extract_withdrawal_amount(str(row['Date   Value Description']), row.iloc[withdrawal_col_idx])
+                            if withdrawal_amount is not None:
+                                current_transaction['Withdrawal'] = withdrawal_amount
+                        if balance_col_idx < len(row) and pd.notna(row.iloc[balance_col_idx]):
+                            current_transaction['Balance'] = row.iloc[balance_col_idx]
                 if current_transaction is not None:
                     transactions.append(current_transaction)
                 final_df = pd.DataFrame(transactions)
                 if 'Description' in final_df.columns:
+                    final_df['Description'] = final_df['Description'].apply(clean_description)
                     final_df['Description'] = final_df['Description'].apply(format_description)
                 if 'Withdrawal' in final_df.columns:
                     final_df['Withdrawal'] = final_df['Withdrawal'].apply(clean_amount)
@@ -202,6 +259,42 @@ def extract_bank_statement(pdf_path, password):
         print(f"Error processing PDF: {str(e)}")
         return None
 
+def clean_description(desc):
+    """Clean description by removing account information and header text."""
+    if pd.isna(desc):
+        return None
+    
+    desc = str(desc).strip()
+    
+    # Remove account information patterns
+    patterns_to_remove = [
+        r'STATEMENT DATE.*?Phone No\.: \d+',
+        r'CURRENCY.*?Phone No\.: \d+',
+        r'ACCOUNT TYPE.*?Phone No\.: \d+',
+        r'ACCOUNT NO.*?Phone No\.: \d+',
+        r'NOMINEE REGISTERED.*?Phone No\.: \d+',
+        r'BRANCH ADDRESS.*?Phone No\.: \d+',
+        r'ABR Complex.*?Phone No\.: \d+',
+        r'EPIP Zone.*?Phone No\.: \d+',
+        r'Whitefield.*?Phone No\.: \d+',
+        r'Bengaluru.*?Phone No\.: \d+',
+        r'Karnataka.*?Phone No\.: \d+',
+        r'560066.*?Phone No\.: \d+',
+        r'IFSC.*?Phone No\.: \d+',
+        r'MICR CODE.*?Phone No\.: \d+',
+        r'Phone No\.: \d+',
+        r'Balance Brought Forward',
+        r'Date   Value Description Date',
+    ]
+    
+    for pattern in patterns_to_remove:
+        desc = re.sub(pattern, '', desc, flags=re.IGNORECASE | re.DOTALL)
+    
+    # Clean up extra whitespace
+    desc = re.sub(r'\s+', ' ', desc).strip()
+    
+    return desc if desc else None
+
 def main():
     if len(sys.argv) != 3:
         print("Usage: python pdf_analyzer.py <pdf_path> <password>")
@@ -214,12 +307,19 @@ def main():
     # Extract the data
     df = extract_bank_statement(pdf_path, password)
     if df is not None:
-        # Save the extracted data to CSV with timestamp to avoid permission issues
+        # Save the extracted data to CSV with original name
         output_path = Path(pdf_path).with_suffix('.csv')
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = output_path.parent / f"{output_path.stem}_processed_{timestamp}.csv"
-        df.to_csv(output_path, index=False)
-        print(f"\nData successfully extracted and saved to {output_path}")
+        try:
+            df.to_csv(output_path, index=False)
+            print(f"\nData successfully extracted and saved to {output_path}")
+        except PermissionError:
+            # If permission denied, try with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = output_path.parent / f"{output_path.stem}_processed_{timestamp}.csv"
+            df.to_csv(output_path, index=False)
+            print(f"\nData successfully extracted and saved to {output_path}")
+            print("Note: Original filename was in use, so timestamp was added.")
+        
         # Display first few rows
         print("\nFirst few rows of extracted data:")
         print(df.head(10))
