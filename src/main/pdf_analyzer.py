@@ -92,13 +92,17 @@ def format_description(desc):
     # Handle other transactions
     return desc
 
-def extract_withdrawal_amount(row_str, withdrawal_col_value):
-    """Extract withdrawal amount from row data."""
+def extract_withdrawal_amount(row_str, withdrawal_col_value, balance_col_value):
+    """Extract withdrawal amount from row data, ensuring it's different from balance."""
     # First check the withdrawal column
     if pd.notna(withdrawal_col_value):
-        amount = clean_amount(withdrawal_col_value)
-        if amount is not None and amount > 0:
-            return amount
+        withdrawal_amount = clean_amount(withdrawal_col_value)
+        balance_amount = clean_amount(balance_col_value)
+        
+        # Only return withdrawal if it's different from balance and positive
+        if withdrawal_amount is not None and withdrawal_amount > 0:
+            if balance_amount is None or withdrawal_amount != balance_amount:
+                return withdrawal_amount
     
     # Look for withdrawal patterns in the description
     # Common patterns: "WITHDRAWAL", "DEBIT", "PAYMENT", "PURCHASE"
@@ -115,8 +119,44 @@ def extract_withdrawal_amount(row_str, withdrawal_col_value):
             matches = re.findall(pattern, row_str)
             for match in matches:
                 amount = clean_amount(match)
+                balance_amount = clean_amount(balance_col_value)
                 if amount is not None and amount > 0:
-                    return amount
+                    if balance_amount is None or amount != balance_amount:
+                        return amount
+    
+    return None
+
+def extract_deposit_amount(row_str, deposit_col_value, balance_col_value):
+    """Extract deposit amount from row data, ensuring it's different from balance."""
+    # First check the deposit column
+    if pd.notna(deposit_col_value):
+        deposit_amount = clean_amount(deposit_col_value)
+        balance_amount = clean_amount(balance_col_value)
+        
+        # Only return deposit if it's different from balance and positive
+        if deposit_amount is not None and deposit_amount > 0:
+            if balance_amount is None or deposit_amount != balance_amount:
+                return deposit_amount
+    
+    # Look for deposit patterns in the description
+    # Common patterns: "CREDIT", "DEPOSIT", "CHEQUE", "NEFT CREDIT", "RTGS CREDIT"
+    deposit_keywords = ['CREDIT', 'DEPOSIT', 'CHEQUE', 'NEFT CREDIT', 'RTGS CREDIT', 'SALARY', 'REFUND']
+    if any(keyword in row_str.upper() for keyword in deposit_keywords):
+        # Look for amount patterns in the description
+        amount_patterns = [
+            r'(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)',  # Numbers with commas and decimals
+            r'(\d+\.\d{2})',  # Decimal amounts
+            r'(\d+)',  # Whole numbers
+        ]
+        
+        for pattern in amount_patterns:
+            matches = re.findall(pattern, row_str)
+            for match in matches:
+                amount = clean_amount(match)
+                balance_amount = clean_amount(balance_col_value)
+                if amount is not None and amount > 0:
+                    if balance_amount is None or amount != balance_amount:
+                        return amount
     
     return None
 
@@ -162,15 +202,14 @@ def extract_bank_statement(pdf_path, password):
                 data_df.columns = [str(col).strip() for col in data_df.columns]
                 print(f"\nCleaned column names: {data_df.columns.tolist()}")
                 
-                # Identify the withdrawal column (6th column, index 5)
-                withdrawal_col_idx = 5  # 6th column (0-indexed)
-                balance_col_idx = 5  # Balance is also in the 6th column or we need to find it
+                # Based on the PDF structure, use the actual column indices
+                # From the output we saw: ['Date   Value Description', 'Cheque Deposit', 'nan', 'Withdrawal', 'nan', 'Balance', ...]
+                date_desc_col = 'Date   Value Description'  # Column 0
+                deposit_col_idx = 1  # 'Cheque Deposit' column
+                withdrawal_col_idx = 3  # 'Withdrawal' column  
+                balance_col_idx = 5  # 'Balance' column
                 
-                # Find balance column
-                for i, col_name in enumerate(data_df.columns):
-                    if 'balance' in str(col_name).lower():
-                        balance_col_idx = i
-                        break
+                print(f"Using columns: Date/Desc={date_desc_col}, Deposit={deposit_col_idx}, Withdrawal={withdrawal_col_idx}, Balance={balance_col_idx}")
                 
                 transactions = []
                 current_transaction = None
@@ -180,7 +219,7 @@ def extract_bank_statement(pdf_path, password):
                 prev_day = None
                 year = 2024
                 for idx, row in data_df.iterrows():
-                    row_str = str(row['Date   Value Description'])
+                    row_str = str(row[date_desc_col])
                     # Only match 'Month Day' (e.g., 'Jan 01')
                     match = re.search(r'([A-Za-z]{3})\s+(\d{1,2})', row_str)
                     found_date = None
@@ -201,50 +240,66 @@ def extract_bank_statement(pdf_path, password):
                     # Check if this row contains transaction data
                     has_transaction_data = (
                         pd.notna(row.iloc[withdrawal_col_idx]) or 
+                        pd.notna(row.iloc[deposit_col_idx]) or
                         pd.notna(row.iloc[balance_col_idx]) or
-                        (pd.notna(row['Date   Value Description']) and 
+                        (pd.notna(row[date_desc_col]) and 
                          not re.search(r'CURRENCY|ACCOUNT|BRANCH|Date|STATEMENT|NOMINEE|ADDRESS|IFSC|MICR|Phone|Brought Forward|ABR Complex|EPIP Zone|Whitefield|Bengaluru|Karnataka|560066|560036004|9036002402', row_str, re.IGNORECASE))
                     )
                     
                     # Additional check to exclude rows that are clearly not transactions
                     if has_transaction_data and found_date:
                         # Skip if the description contains account information
-                        desc_str = str(row['Date   Value Description'])
+                        desc_str = str(row[date_desc_col])
                         if re.search(r'STATEMENT DATE|CURRENCY|ACCOUNT TYPE|ACCOUNT NO|NOMINEE REGISTERED|BRANCH ADDRESS|ABR Complex|EPIP Zone|Whitefield|Bengaluru|Karnataka|560066|IFSC|MICR CODE|Phone No|Balance Brought Forward', desc_str, re.IGNORECASE):
                             has_transaction_data = False
                     if has_transaction_data and found_date:
                         if current_transaction is not None:
                             transactions.append(current_transaction)
                         
-                        # Extract withdrawal amount from 6th column
-                        withdrawal_amount = extract_withdrawal_amount(row_str, row.iloc[withdrawal_col_idx])
+                        # Extract amounts from the correct columns
+                        withdrawal_amount = clean_amount(row.iloc[withdrawal_col_idx])
+                        deposit_amount = clean_amount(row.iloc[deposit_col_idx])
+                        balance_amount = clean_amount(row.iloc[balance_col_idx])
                         
                         current_transaction = {
                             'Value Date': found_date,
-                            'Description': row['Date   Value Description'],
+                            'Description': row[date_desc_col],
+                            'Deposit': deposit_amount,
                             'Withdrawal': withdrawal_amount,
-                            'Balance': row.iloc[balance_col_idx] if balance_col_idx < len(row) else None
+                            'Balance': balance_amount
                         }
                     elif current_transaction is not None:
-                        if pd.notna(row['Date   Value Description']):
-                            current_transaction['Description'] += ' ' + str(row['Date   Value Description'])
-                        # Update withdrawal if found in continuation rows
+                        if pd.notna(row[date_desc_col]):
+                            current_transaction['Description'] += ' ' + str(row[date_desc_col])
+                        # Update amounts if found in continuation rows
                         if pd.notna(row.iloc[withdrawal_col_idx]):
-                            withdrawal_amount = extract_withdrawal_amount(str(row['Date   Value Description']), row.iloc[withdrawal_col_idx])
+                            withdrawal_amount = clean_amount(row.iloc[withdrawal_col_idx])
                             if withdrawal_amount is not None:
                                 current_transaction['Withdrawal'] = withdrawal_amount
-                        if balance_col_idx < len(row) and pd.notna(row.iloc[balance_col_idx]):
-                            current_transaction['Balance'] = row.iloc[balance_col_idx]
+                        if pd.notna(row.iloc[deposit_col_idx]):
+                            deposit_amount = clean_amount(row.iloc[deposit_col_idx])
+                            if deposit_amount is not None:
+                                current_transaction['Deposit'] = deposit_amount
+                        if pd.notna(row.iloc[balance_col_idx]):
+                            balance_amount = clean_amount(row.iloc[balance_col_idx])
+                            if balance_amount is not None:
+                                current_transaction['Balance'] = balance_amount
                 if current_transaction is not None:
                     transactions.append(current_transaction)
                 final_df = pd.DataFrame(transactions)
                 if 'Description' in final_df.columns:
                     final_df['Description'] = final_df['Description'].apply(clean_description)
                     final_df['Description'] = final_df['Description'].apply(format_description)
+                if 'Deposit' in final_df.columns:
+                    final_df['Deposit'] = final_df['Deposit'].apply(clean_amount)
                 if 'Withdrawal' in final_df.columns:
                     final_df['Withdrawal'] = final_df['Withdrawal'].apply(clean_amount)
                 if 'Balance' in final_df.columns:
                     final_df['Balance'] = final_df['Balance'].apply(clean_amount)
+                
+                # Ensure proper column order
+                column_order = ['Value Date', 'Description', 'Deposit', 'Withdrawal', 'Balance']
+                final_df = final_df.reindex(columns=column_order, fill_value=None)
                 final_df = final_df.dropna(how='all')
                 if 'Value Date' in final_df.columns:
                     final_df = final_df.sort_values('Value Date', ascending=True)
