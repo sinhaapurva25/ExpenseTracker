@@ -183,53 +183,46 @@ def extract_bank_statement(pdf_path, password):
             pandas_options={'dtype': str}
         )
         print(f"\nFound {len(tables)} tables in the PDF")
+        # Debug: Print column names for the first 30 tables
+        for i, table in enumerate(tables[:30]):
+            print(f"Table {i} columns: {list(table.columns)}")
         if len(tables) > 0:
-            combined_df = pd.concat(tables, ignore_index=True)
-            print("\nColumns found in the PDF:")
-            print(combined_df.columns.tolist())
-            header_row_idx = None
-            for i, row in combined_df.iterrows():
-                row_str = ','.join([str(x) for x in row.values])
-                if re.search(r'Date.*Value.*Description.*Balance', row_str, re.IGNORECASE):
-                    header_row_idx = i
-                    break
-            if header_row_idx is not None:
-                print(f"\nFound header row at index {header_row_idx}")
-                new_header = combined_df.iloc[header_row_idx].tolist()
-                print(f"\nNew header: {new_header}")
-                data_df = combined_df.iloc[header_row_idx+1:].copy()
-                data_df.columns = new_header
-                data_df.columns = [str(col).strip() for col in data_df.columns]
-                print(f"\nCleaned column names: {data_df.columns.tolist()}")
-                
-                # Based on the PDF structure, use the actual column indices
-                # From the output we saw: ['Date   Value Description', 'Cheque Deposit', 'nan', 'Withdrawal', 'nan', 'Balance', ...]
-                date_desc_col = 'Date   Value Description'  # Column 0
-                deposit_col_idx = 1  # 'Cheque Deposit' column
-                withdrawal_col_idx = 3  # 'Withdrawal' column  
-                balance_col_idx = 5  # 'Balance' column
-                
-                print(f"Using columns: Date/Desc={date_desc_col}, Deposit={deposit_col_idx}, Withdrawal={withdrawal_col_idx}, Balance={balance_col_idx}")
-                
-                transactions = []
-                current_transaction = None
-                # --- Chronological date logic ---
-                month_map = {m: i for i, m in enumerate(['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'], 1)}
-                prev_month = None
-                prev_day = None
-                year = 2024
-                for idx, row in data_df.iterrows():
-                    row_str = str(row[date_desc_col])
-                    # Only match 'Month Day' (e.g., 'Jan 01')
+            # Standard column names we want
+            standard_cols = {
+                'date_desc': ['date   value description', 'date', 'value date', 'description'],
+                'deposit': ['cheque deposit', 'deposit', 'credit', 'deposits'],
+                'withdrawal': ['withdrawal', 'debit', 'payment', 'withdrawals'],
+                'balance': ['balance', 'closing balance', 'available balance']
+            }
+            
+            all_transactions = []
+            month_map = {m: i for i, m in enumerate(['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'], 1)}
+            prev_month = None
+            prev_day = None
+            year = 2024
+            
+            for table in tables:
+                df = table.copy()
+                df.columns = [str(col).strip().lower() for col in df.columns]
+                col_map = {}
+                for key, options in standard_cols.items():
+                    for col in df.columns:
+                        if any(opt in col for opt in options):
+                            col_map[key] = col
+                            break
+                # Skip tables that don't have at least date/desc and balance
+                if 'date_desc' not in col_map or 'balance' not in col_map:
+                    continue
+                for idx, row in df.iterrows():
+                    row_str = str(row[col_map['date_desc']])
                     match = re.search(r'([A-Za-z]{3})\s+(\d{1,2})', row_str)
                     found_date = None
                     if match:
                         month_str, day_str = match.groups()
                         month = month_map.get(month_str.capitalize())
-                        if month is not None:  # Only proceed if we found a valid month
+                        if month is not None:
                             day = int(day_str)
                             if prev_month is not None and prev_day is not None:
-                                # If month goes backward, increment year
                                 if (month < prev_month) or (month == prev_month and day < prev_day):
                                     year += 1
                             prev_month = month
@@ -237,76 +230,43 @@ def extract_bank_statement(pdf_path, password):
                             found_date = f"{year}-{month:02d}-{day:02d}"
                     if found_date:
                         current_date = found_date
-                    # Check if this row contains transaction data
+                    # Filtering
                     has_transaction_data = (
-                        pd.notna(row.iloc[withdrawal_col_idx]) or 
-                        pd.notna(row.iloc[deposit_col_idx]) or
-                        pd.notna(row.iloc[balance_col_idx]) or
-                        (pd.notna(row[date_desc_col]) and 
-                         not re.search(r'CURRENCY|ACCOUNT|BRANCH|Date|STATEMENT|NOMINEE|ADDRESS|IFSC|MICR|Phone|Brought Forward|ABR Complex|EPIP Zone|Whitefield|Bengaluru|Karnataka|560066|560036004|9036002402', row_str, re.IGNORECASE))
+                        (col_map.get('withdrawal') and pd.notna(row.get(col_map['withdrawal']))) or
+                        (col_map.get('deposit') and pd.notna(row.get(col_map['deposit']))) or
+                        pd.notna(row.get(col_map['balance'])) or
+                        (pd.notna(row.get(col_map['date_desc'])) and not re.search(r'CURRENCY|ACCOUNT|BRANCH|Date|STATEMENT|NOMINEE|ADDRESS|IFSC|MICR|Phone|Brought Forward|ABR Complex|EPIP Zone|Whitefield|Bengaluru|Karnataka|560066|560036004|9036002402', row_str, re.IGNORECASE))
                     )
-                    
-                    # Additional check to exclude rows that are clearly not transactions
+                    desc_str = str(row.get(col_map['date_desc'], ''))
+                    if re.search(r'STATEMENT DATE|CURRENCY|ACCOUNT TYPE|ACCOUNT NO|NOMINEE REGISTERED|BRANCH ADDRESS|ABR Complex|EPIP Zone|Whitefield|Bengaluru|Karnataka|560066|IFSC|MICR CODE|Phone No|Balance Brought Forward', desc_str, re.IGNORECASE):
+                        has_transaction_data = False
                     if has_transaction_data and found_date:
-                        # Skip if the description contains account information
-                        desc_str = str(row[date_desc_col])
-                        if re.search(r'STATEMENT DATE|CURRENCY|ACCOUNT TYPE|ACCOUNT NO|NOMINEE REGISTERED|BRANCH ADDRESS|ABR Complex|EPIP Zone|Whitefield|Bengaluru|Karnataka|560066|IFSC|MICR CODE|Phone No|Balance Brought Forward', desc_str, re.IGNORECASE):
-                            has_transaction_data = False
-                    if has_transaction_data and found_date:
-                        if current_transaction is not None:
-                            transactions.append(current_transaction)
-                        
-                        # Extract amounts from the correct columns
-                        withdrawal_amount = clean_amount(row.iloc[withdrawal_col_idx])
-                        deposit_amount = clean_amount(row.iloc[deposit_col_idx])
-                        balance_amount = clean_amount(row.iloc[balance_col_idx])
-                        
-                        current_transaction = {
+                        deposit_amount = clean_amount(row.get(col_map.get('deposit'), None)) if col_map.get('deposit') else None
+                        withdrawal_amount = clean_amount(row.get(col_map.get('withdrawal'), None)) if col_map.get('withdrawal') else None
+                        balance_amount = clean_amount(row.get(col_map.get('balance'), None)) if col_map.get('balance') else None
+                        all_transactions.append({
                             'Value Date': found_date,
-                            'Description': row[date_desc_col],
+                            'Description': row.get(col_map['date_desc'], None),
                             'Deposit': deposit_amount,
                             'Withdrawal': withdrawal_amount,
                             'Balance': balance_amount
-                        }
-                    elif current_transaction is not None:
-                        if pd.notna(row[date_desc_col]):
-                            current_transaction['Description'] += ' ' + str(row[date_desc_col])
-                        # Update amounts if found in continuation rows
-                        if pd.notna(row.iloc[withdrawal_col_idx]):
-                            withdrawal_amount = clean_amount(row.iloc[withdrawal_col_idx])
-                            if withdrawal_amount is not None:
-                                current_transaction['Withdrawal'] = withdrawal_amount
-                        if pd.notna(row.iloc[deposit_col_idx]):
-                            deposit_amount = clean_amount(row.iloc[deposit_col_idx])
-                            if deposit_amount is not None:
-                                current_transaction['Deposit'] = deposit_amount
-                        if pd.notna(row.iloc[balance_col_idx]):
-                            balance_amount = clean_amount(row.iloc[balance_col_idx])
-                            if balance_amount is not None:
-                                current_transaction['Balance'] = balance_amount
-                if current_transaction is not None:
-                    transactions.append(current_transaction)
-                final_df = pd.DataFrame(transactions)
-                if 'Description' in final_df.columns:
-                    final_df['Description'] = final_df['Description'].apply(clean_description)
-                    final_df['Description'] = final_df['Description'].apply(format_description)
-                if 'Deposit' in final_df.columns:
-                    final_df['Deposit'] = final_df['Deposit'].apply(clean_amount)
-                if 'Withdrawal' in final_df.columns:
-                    final_df['Withdrawal'] = final_df['Withdrawal'].apply(clean_amount)
-                if 'Balance' in final_df.columns:
-                    final_df['Balance'] = final_df['Balance'].apply(clean_amount)
-                
-                # Ensure proper column order
-                column_order = ['Value Date', 'Description', 'Deposit', 'Withdrawal', 'Balance']
-                final_df = final_df.reindex(columns=column_order, fill_value=None)
-                final_df = final_df.dropna(how='all')
-                if 'Value Date' in final_df.columns:
-                    final_df = final_df.sort_values('Value Date', ascending=True)
-                return final_df
-            else:
-                print("Could not find the transaction table header in the PDF.")
-                return None
+                        })
+            final_df = pd.DataFrame(all_transactions)
+            if 'Description' in final_df.columns:
+                final_df['Description'] = final_df['Description'].apply(clean_description)
+                final_df['Description'] = final_df['Description'].apply(format_description)
+            if 'Deposit' in final_df.columns:
+                final_df['Deposit'] = final_df['Deposit'].apply(clean_amount)
+            if 'Withdrawal' in final_df.columns:
+                final_df['Withdrawal'] = final_df['Withdrawal'].apply(clean_amount)
+            if 'Balance' in final_df.columns:
+                final_df['Balance'] = final_df['Balance'].apply(clean_amount)
+            column_order = ['Value Date', 'Description', 'Deposit', 'Withdrawal', 'Balance']
+            final_df = final_df.reindex(columns=column_order, fill_value=None)
+            final_df = final_df.dropna(how='all')
+            if 'Value Date' in final_df.columns:
+                final_df = final_df.sort_values('Value Date', ascending=True)
+            return final_df
         else:
             print("No tables found in the PDF.")
             return None
